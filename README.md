@@ -1,35 +1,13 @@
-# Kite Day Trader (Starter)
+# Kite Day Trader (Quality Server)
 
-A simple Flask + Kite Connect starter for day trading on NIFTY50 with:
-- Scanner (EMA 5/10, RSI, daily pivots)
-- Queue + Confirm flow (manual or auto-confirm helper)
-- MIS orders (LONG/SHORT)
-- TP/SL engine (LIMIT off-market, MARKET when live if `exit_pref=AUTO`)
-- Trade/Error logs + Realized P&L
+## Deploy on Render (Quality server)
+1. Add env vars from `.env.example` to Render dashboard
+2. Build command: `pip install -r requirements.txt`
+3. Start command: `gunicorn app:app --bind 0.0.0.0:$PORT`
 
-## Setup
-
+## Auto Confirm (sidecar)
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-export KITE_API_KEY=xxxx
-export KITE_API_SECRET=yyyy
-export INVEST_AMOUNT=12000
-export AUTO_CONFIRM_TOKEN=some-long-random
-export REDIRECT_URL=http://localhost:5000/login/callback
-python app.py
-```
-
-Open http://localhost:5000 and click **Login with Kite** (configure same redirect URL in your Kite app).
-
-## Auto-confirm helper (optional)
-
-```bash
-export APP_URL=http://localhost:5000
-export AUTO_CONFIRM_TOKEN=some-long-random
+export APP_URL="https://krishna-idxy.onrender.com"
+export AUTO_CONFIRM_TOKEN="your-secret-token"
 python auto_confirm.py
 ```
-
-## Notes
-- Educational template. Harden for production: order state checks, SL-M stops, retries, rate limits, etc.
-- Short selling is subject to broker/exchange rules for MIS.
