@@ -1,4 +1,5 @@
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify, redirect, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 from kiteconnect import KiteConnect
 from datetime import datetime
 from pytz import timezone
@@ -7,13 +8,13 @@ import os, time, threading, traceback
 # ───────────────────────────── Config ─────────────────────────────
 IST = timezone("Asia/Kolkata")
 
-KITE_API_KEY      = os.environ.get("KITE_API_KEY", "")
-KITE_API_SECRET   = os.environ.get("KITE_API_SECRET", "")
-AUTO_CONFIRM_TOKEN= os.environ.get("AUTO_CONFIRM_TOKEN", "changeme")
-INVEST_AMOUNT     = float(os.environ.get("INVEST_AMOUNT", "10000"))
-REDIRECT_URL      = os.environ.get("REDIRECT_URL", "http://localhost:5000/login/callback")
+KITE_API_KEY       = os.environ.get("KITE_API_KEY", "")
+KITE_API_SECRET    = os.environ.get("KITE_API_SECRET", "")
+AUTO_CONFIRM_TOKEN = os.environ.get("AUTO_CONFIRM_TOKEN", "changeme")
+INVEST_AMOUNT      = float(os.environ.get("INVEST_AMOUNT", "10000"))
+REDIRECT_URL       = os.environ.get("REDIRECT_URL", "http://localhost:5000/login/callback")
 
-# NSE tradingsymbols for NIFTY 50 (edit if your broker lists differ)
+# NSE tradingsymbols for NIFTY 50
 NIFTY50 = [
     "ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJFINANCE",
     "BAJAJFINSV","BHARTIARTL","BPCL","BRITANNIA","CIPLA","COALINDIA","DIVISLAB","DRREDDY",
@@ -24,6 +25,10 @@ NIFTY50 = [
 ]
 
 app = Flask(__name__)
+
+# Trust Render's proxy so redirects/URLs/HTTPS work correctly
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+app.config["PREFERRED_URL_SCHEME"] = "https"
 
 state = {
     "access_token": None,
@@ -65,6 +70,14 @@ def kite():
             kite._client.set_access_token(state["access_token"])
     return kite._client
 
+def get_login_url():
+    kc = kite()
+    # Compatibility with both property and method forms
+    try:
+        return kc.login_url()
+    except TypeError:
+        return kc.login_url
+
 def ltp(symbol):
     data = kite().ltp([f"NSE:{symbol}"])
     return float(data[f"NSE:{symbol}"]["last_price"])
@@ -94,8 +107,7 @@ def submit_order(symbol, txn_type, qty, order_type, price=None, tag="app"):
 # ───────────────────────────── Auth ─────────────────────────────
 @app.route("/login/start")
 def login_start():
-    _ = kite().login_url
-    return redirect(kite().login_url())
+    return redirect(get_login_url())
 
 @app.route("/login/callback")
 def login_callback():
@@ -107,7 +119,18 @@ def login_callback():
         state["access_token"] = data["access_token"]
         kite().set_access_token(state["access_token"])
         log_trade("Kite login success", {"user_id": data.get("user_id")})
-        return redirect("/")
+        # Normal redirect to home
+        try:
+            return redirect(url_for("home"))
+        except Exception:
+            pass
+        # Fallback for strict/mobile browsers
+        return (
+            "<script>location.replace('/');</script>"
+            "<noscript><a href='/'>Continue to home</a></noscript>",
+            200,
+            {"Content-Type": "text/html"},
+        )
     except Exception as e:
         log_err("Login error", {"error": str(e), "trace": traceback.format_exc()})
         return "Login failed. See /api/logs?type=error", 500
