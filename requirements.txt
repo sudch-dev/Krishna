@@ -1,10 +1,5 @@
---only-binary=:all:
---prefer-binary
-flask==3.0.3
-gunicorn==21.2.0
-kiteconnect==5.0.1
-pandas==2.2.3
-numpy==1.26.4
-pytz==2024.1
-python-dateutil==2.9.0.post0
-requests==2.32.3
+flask
+kiteconnect
+python-dotenv
+gunicorn
+pytz
