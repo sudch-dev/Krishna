@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Kite Day Trader – NIFTY50 Scanner</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 16px; }
+    header { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    .tag { padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid #ddd; }
+    .live { background:#e9ffe9; border-color:#8fd98f; }
+    .off  { background:#fff3e0; border-color:#ffb74d; }
+    form.panel { border:1px solid #e5e5e5; padding:12px; border-radius:8px; margin:12px 0; display:grid; gap:8px; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); }
+    label { font-size:12px; color:#555; display:block; margin-bottom:4px; }
+    input, select, button { width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; }
+    button.primary { background:#1849ff; color:white; border:none; }
+    .cols { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    .card { border:1px solid #eee; border-radius:8px; padding:10px; margin-bottom:8px; }
+    .small { font-size:12px; color:#666; }
+    .kicker { font-size:12px; display:inline-flex; gap:6px; align-items:center; }
+    .pill { padding:2px 8px; background:#f2f2f2; border-radius:999px; font-size:11px; }
+    .danger { background:#ffecec; }
+    .success { background:#e7ffef; }
+    .row { display:flex; gap:8px; align-items:center; justify-content:space-between; }
+    .grid { display:grid; gap:8px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+    pre { white-space:pre-wrap; font-size:12px; background:#fafafa; padding:8px; border:1px solid #eee; border-radius:6px; }
+  </style>
+</head>
+<body>
+<header>
+  <h2 style="margin:0;">Kite Day Trader</h2>
+  <span id="liveTag" class="tag">Checking…</span>
+  <span class="tag">INVEST_AMOUNT (env): ₹<span id="envInvest"></span></span>
+  <span class="tag" id="authState">Auth: …</span>
+  <a id="kiteLogin" href="#" class="tag" style="text-decoration:none;">Login with Kite</a>
+</header>
+
+<form class="panel" id="scanForm">
+  <div>
+    <label>Interval</label>
+    <select name="interval">
+      <option value="5minute">5 minute</option>
+      <option value="15minute" selected>15 minute</option>
+      <option value="30minute">30 minute</option>
+      <option value="day">Day</option>
+    </select>
+  </div>
+  <div>
+    <label>TP %</label>
+    <input name="tp_pct" type="number" step="0.1" value="0.8"/>
+  </div>
+  <div>
+    <label>SL %</label>
+    <input name="sl_pct" type="number" step="0.1" value="0.4"/>
+  </div>
+  <div>
+    <label>Entry Order Type</label>
+    <select name="entry_order_type">
+      <option value="LIMIT" selected>LIMIT</option>
+      <option value="MARKET">MARKET</option>
+    </select>
+  </div>
+  <div>
+    <label>Exit Order Preference</label>
+    <select name="exit_order_pref" title="AUTO = limit off-market, market when live">
+      <option value="AUTO" selected>AUTO</option>
+      <option value="LIMIT">LIMIT</option>
+      <option value="MARKET">MARKET</option>
+    </select>
+  </div>
+  <div>
+    <label>Investment Target (overrides env)</label>
+    <input name="investment_target" type="number" step="1" placeholder="e.g. 12000"/>
+  </div>
+  <div style="align-self:end;">
+    <button class="primary" type="submit">🔎 Scan NIFTY50</button>
+  </div>
+</form>
+
+<div class="cols">
+  <section>
+    <h3>📈 Long Candidates</h3>
+    <div id="longGrid" class="grid"></div>
+  </section>
+  <section>
+    <h3>📉 Short Candidates</h3>
+    <div id="shortGrid" class="grid"></div>
+  </section>
+</div>
+
+<section>
+  <h3>🧾 Pending Confirms</h3>
+  <div id="pending"></div>
+</section>
+
+<section class="cols">
+  <div>
+    <h3>📊 Open Positions</h3>
+    <div id="positions"></div>
+  </div>
+  <div>
+    <h3>✅ Closed (Realized P&L: ₹<span id="rpnl">0</span>)</h3>
+    <div id="closed"></div>
+  </div>
+</section>
+
+<section class="cols">
+  <div>
+    <h3>🪵 Trade Log</h3>
+    <div id="tlog"></div>
+  </div>
+  <div>
+    <h3>⚠️ Error Log</h3>
+    <div id="elog"></div>
+  </div>
+</section>
+
+<script>
+const envInvest = {{ invest_amount|tojson }};
+const isLive = {{ is_live|tojson }};
+const redirectUrl = {{ redirect_url|tojson }};
+const loggedIn = {{ logged_in|tojson }};
+
+document.getElementById("envInvest").textContent = envInvest.toFixed(0);
+document.getElementById("liveTag").textContent = isLive ? "LIVE Market" : "OFF Market";
+document.getElementById("liveTag").className = "tag " + (isLive ? "live" : "off");
+document.getElementById("authState").textContent = loggedIn ? "Auth: OK" : "Auth: Not logged in";
+document.getElementById("kiteLogin").href = "/login/start";
+
+function rowPick(p, side) {
+  const title = `${p.symbol} @ ₹${p.ltp.toFixed(2)} • Qty ${p.qty}`;
+  return `
+    <div class="card">
+      <div class="row">
+        <strong>${title}</strong>
+        <span class="pill">${side}</span>
+      </div>
+      <div class="small">TP ${p.tp_pct}% • SL ${p.sl_pct}% • Entry ${p.entry_order_type} • Exit ${p.exit_order_pref} • ${p.interval}</div>
+      <div style="margin-top:6px;display:flex;gap:8px;">
+        <button onclick='queueOrder(${JSON.stringify(p).replaceAll("'","&#39;")}, "${side}")'>Queue & Confirm</button>
+      </div>
+    </div>`;
+}
+
+async function queueOrder(p, side) {
+  const body = {
+    symbol: p.symbol, side: side, qty: p.qty,
+    entry_order_type: p.entry_order_type,
+    tp_pct: p.tp_pct, sl_pct: p.sl_pct,
+    exit_order_pref: p.exit_order_pref
+  };
+  const r = await fetch("/api/queue_order", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!j.ok) { alert("Queue failed: " + (j.error||"")); return; }
+  refreshPending();
+}
+
+async function refreshPending() {
+  const r = await fetch("/api/pending");
+  const j = await r.json();
+  if (!j.ok) return;
+  const el = document.getElementById("pending");
+  el.innerHTML = "";
+  j.pending.forEach((p, i) => {
+    const line = `${i+1}. ${p.side} ${p.symbol} • Qty ${p.qty} • Entry ${p.entry_order_type} • TP ${p.tp_pct}% • SL ${p.sl_pct}%`;
+    const div = document.createElement("div");
+    div.className = "card";
+    div.innerHTML = `<div class="row"><div>${line}</div>
+      <div style="display:flex;gap:6px;">
+        <button onclick="confirmIdx(${i})" class="primary">Confirm</button>
+      </div></div>`;
+    el.appendChild(div);
+  });
+}
+
+async function confirmIdx(i) {
+  const token = prompt("Enter AUTO_CONFIRM_TOKEN (or set an auto-click script):");
+  if (!token) return;
+  const r = await fetch("/api/confirm", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({index:i, token})});
+  const j = await r.json();
+  if (!j.ok) { alert("Confirm failed: " + (j.error||"")); return; }
+  refreshAll();
+}
+
+document.getElementById("scanForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = Object.fromEntries(fd.entries());
+  if (body.investment_target === "") delete body.investment_target;
+  body.tp_pct = parseFloat(body.tp_pct);
+  body.sl_pct = parseFloat(body.sl_pct);
+  const r = await fetch("/api/scan", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!j.ok) { alert("Scan failed: " + (j.error||"")); return; }
+  const L = document.getElementById("longGrid");
+  const S = document.getElementById("shortGrid");
+  L.innerHTML = ""; S.innerHTML = "";
+  j.long.forEach(p => L.insertAdjacentHTML("beforeend", rowPick(p, "LONG")));
+  j.short.forEach(p => S.insertAdjacentHTML("beforeend", rowPick(p, "SHORT")));
+});
+
+async function refreshStatus() {
+  const r = await fetch("/api/status");
+  const j = await r.json();
+  if (!j.ok) return;
+  document.getElementById("rpnl").textContent = (j.realized_pnl||0).toFixed(2);
+
+  const P = document.getElementById("positions");
+  P.innerHTML = "";
+  j.positions.forEach(p => {
+    const pnl = p.pnl !== undefined ? ` • P&L ₹${p.pnl}` : "";
+    P.insertAdjacentHTML("beforeend",
+      `<div class="card ${p.open? "" : "success"}">
+        <div class="row">
+          <strong>${p.symbol} • ${p.side} • Qty ${p.qty}</strong>
+          <span class="pill">Entry ₹${p.entry_price.toFixed(2)}</span>
+        </div>
+        <div class="small">TP ${p.tp_pct}% • SL ${p.sl_pct}% • ExitPref ${p.exit_pref}${pnl}</div>
+      </div>`);
+  });
+
+  const C = document.getElementById("closed");
+  C.innerHTML = "";
+  j.closed_trades.slice().reverse().forEach(p => {
+    C.insertAdjacentHTML("beforeend",
+      `<div class="card">
+        <div class="row">
+          <strong>${p.symbol} • ${p.side}</strong>
+          <span class="pill">P&L ₹${(p.pnl||0).toFixed(2)}</span>
+        </div>
+        <div class="small">Entry ₹${p.entry_price.toFixed(2)} • Exit ${p.exit_reason} • Closed ${p.closed_at}</div>
+      </div>`);
+  });
+}
+
+async function refreshLogs() {
+  const t = await (await fetch("/api/logs?type=trade")).json();
+  const e = await (await fetch("/api/logs?type=error")).json();
+  const TL = document.getElementById("tlog"); TL.innerHTML = "";
+  const EL = document.getElementById("elog"); EL.innerHTML = "";
+  (t.logs||[]).slice().reverse().forEach(x => TL.insertAdjacentHTML("beforeend", `<pre>${x.ts} | ${x.msg}\n${JSON.stringify(x.payload||{}, null, 2)}</pre>`));
+  (e.logs||[]).slice().reverse().forEach(x => EL.insertAdjacentHTML("beforeend", `<pre>${x.ts} | ${x.msg}\n${JSON.stringify(x.payload||{}, null, 2)}</pre>`));
+}
+
+function refreshAll(){ refreshPending(); refreshStatus(); refreshLogs(); }
+setInterval(refreshAll, 4000);
+refreshAll();
+</script>
+</body>
+</html>
