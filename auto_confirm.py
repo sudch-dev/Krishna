@@ -1,66 +1,21 @@
 #!/usr/bin/env python3
-"""
-Sidecar executor for Kite Day Trader.
+import os, time, requests
 
-Usage:
-  export APP_URL="https://<your-app>.onrender.com"
-  export AUTO_CONFIRM_TOKEN="same-as-app"
-  export KITE_API_KEY="..."
-  export KITE_API_SECRET="..."
-  python sidecar.py
-"""
-import os, time, requests, traceback
-from kiteconnect import KiteConnect
-from datetime import datetime
-from pytz import timezone
+APP_URL = os.environ.get("APP_URL", "http://localhost:5000")
+TOKEN   = os.environ.get("AUTO_CONFIRM_TOKEN", "changeme")
 
-IST = timezone("Asia/Kolkata")
-APP_URL = os.environ["APP_URL"].rstrip("/")
-TOKEN   = os.environ["AUTO_CONFIRM_TOKEN"]
-
-KITE_API_KEY    = os.environ["KITE_API_KEY"]
-KITE_API_SECRET = os.environ["KITE_API_SECRET"]
-
-kite = KiteConnect(api_key=KITE_API_KEY)
-
-def now_s(): return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-
-def ensure_login():
-    if not getattr(kite, "_logged_in", False):
-        print("[sidecar] Please login via browser once and set access_token manually!")
-        # for demo, assume you already have access token saved
-        kite.set_access_token(os.environ["KITE_ACCESS_TOKEN"])
-        kite._logged_in = True
-
-def run_loop():
-    ensure_login()
-    while True:
-        try:
-            r = requests.get(f"{APP_URL}/api/pending", timeout=10)
-            pending = r.json().get("pending", [])
-            for idx, job in enumerate(pending):
-                if job.get("confirmed") and not job.get("executed"):
-                    print(f"[sidecar] Executing -> {job}")
-                    try:
-                        oid = kite.place_order(
-                            variety="regular",
-                            exchange="NSE",
-                            tradingsymbol=job["symbol"],
-                            transaction_type=("BUY" if job["side"]=="LONG" else "SELL"),
-                            quantity=int(job["qty"]),
-                            product=KiteConnect.PRODUCT_MIS,
-                            order_type=job["entry_order_type"],
-                            validity=KiteConnect.VALIDITY_DAY,
-                            price=None
-                        )
-                        print(f"[sidecar] Order placed -> {oid}")
-                        job["executed"] = True
-                    except Exception as e:
-                        print("[sidecar] ERROR placing order:", str(e))
-            time.sleep(5)
-        except Exception as e:
-            print("[sidecar] loop error:", e)
-            time.sleep(10)
-
-if __name__ == "__main__":
-    run_loop()
+while True:
+    try:
+        r = requests.get(f"{APP_URL}/api/pending", timeout=10).json()
+        pending = r.get("pending", [])
+        if pending:
+            print("[Sidecar] Found pending:", pending[0])
+            res = requests.post(f"{APP_URL}/api/confirm",
+                                json={"index":0,"token":TOKEN},
+                                timeout=10).json()
+            print("[Sidecar] Confirmed:", res)
+        else:
+            print("[Sidecar] No pending orders")
+    except Exception as e:
+        print("[Sidecar] Error:", e)
+    time.sleep(5)
