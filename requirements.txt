@@ -1,6 +1,7 @@
-flask
-kiteconnect
-python-dotenv
-gunicorn
-pytz
-pandas
+Flask==3.0.3
+gunicorn==22.0.0
+pytz==2024.1
+pandas==2.2.2
+numpy==1.26.4
+kiteconnect==5.0.1
+requests==2.32.3
