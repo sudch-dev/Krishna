@@ -1,71 +1,80 @@
 #!/usr/bin/env python3
 """
-Auto-confirm sidecar for the Kite day-trader app (Render-friendly).
+Confirm-only sidecar for the Kite day-trader app.
+
+It DOES NOT scan or queue.
+It ONLY confirms already-queued jobs.
 
 Env:
-  APP_URL="https://<your-app>.onrender.com"
-  AUTO_CONFIRM_TOKEN="your-secret-token"
-  KEEPALIVE_URL="https://<your-app>.onrender.com/keepalive"   # optional
+  APP_URL              e.g. https://<your-app>.onrender.com   (required)
+  AUTO_CONFIRM_TOKEN   must match server's env                 (required)
+  POLL_SEC             seconds between polls (default 3)
+  KEEPALIVE_URL        optional; GET this every POLL_SEC*5
 """
 import os, time, sys, requests
 
 APP_URL = os.environ.get("APP_URL", "").rstrip("/")
 TOKEN   = os.environ.get("AUTO_CONFIRM_TOKEN", "")
-KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL", "").strip()
+POLL    = float(os.environ.get("POLL_SEC", "3"))
+KA_URL  = os.environ.get("KEEPALIVE_URL", "").strip()
 
 if not APP_URL or not TOKEN:
-    print("[auto_confirm] ERROR: Set APP_URL and AUTO_CONFIRM_TOKEN environment variables.")
+    print("[auto_confirm] ERROR: Set APP_URL and AUTO_CONFIRM_TOKEN.")
     sys.exit(1)
 
-session = requests.Session()
-session.headers.update({"User-Agent": "auto-confirm/1.1"})
+S = requests.Session()
+S.headers.update({"User-Agent": "auto-confirm/1.1"})
 
-def confirm_all_pending():
-    # Always pop index 0 (contract with the server)
-    did_any = False
-    while True:
-        r = session.get(f"{APP_URL}/api/pending", timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        pending = data.get("pending", [])
-        if not pending:
-            return did_any
+def get_pending():
+    r = S.get(f"{APP_URL}/api/pending", timeout=10)
+    r.raise_for_status()
+    return (r.json() or {}).get("pending", [])
 
-        payload = {"index": 0, "token": TOKEN}
-        cr = session.post(f"{APP_URL}/api/confirm", json=payload, timeout=15)
-        try:
-            res = cr.json()
-        except Exception:
-            res = {"ok": False, "error": f"HTTP {cr.status_code}: {cr.text[:200]}"}
-        print("[auto_confirm] confirm ->", res)
-        did_any = True
-        time.sleep(1)  # give server a moment to update
-    # unreachable
-
-def maybe_ping_keepalive():
-    if not KEEPALIVE_URL:
-        return
+def confirm_index0():
+    payload = {"index": 0, "token": TOKEN}
+    r = S.post(f"{APP_URL}/api/confirm", json=payload, timeout=15)
     try:
-        pr = session.get(KEEPALIVE_URL, timeout=8, allow_redirects=True)
-        print("[auto_confirm] keepalive:", pr.status_code)
-    except Exception as e:
-        print("[auto_confirm] keepalive error:", str(e))
+        return r.json()
+    except Exception:
+        return {"ok": False, "error": r.text[:200]}
+
+def maybe_keepalive(tick):
+    if KA_URL and (tick % 5 == 0):  # every ~5 polls
+        try:
+            S.get(KA_URL, timeout=5)
+        except Exception:
+            pass
 
 def main():
     print(f"[auto_confirm] watching {APP_URL} ...")
-    backoff = 2
+    backoff = 2.0
+    tick = 0
     while True:
         try:
-            did = confirm_all_pending()
-            if not did:
-                # nothing to do: idle a bit and optionally ping keepalive
-                maybe_ping_keepalive()
-                time.sleep(3)
-            backoff = 2
+            tick += 1
+            maybe_keepalive(tick)
+
+            # drain the queue by repeatedly confirming index 0
+            while True:
+                pending = get_pending()
+                if not pending:
+                    break
+                res = confirm_index0()
+                print("[auto_confirm] confirm ->", res)
+                # small pause to let server update state
+                time.sleep(1.0)
+
+            # nothing pending → sleep regular poll
+            time.sleep(POLL)
+            backoff = 2.0
+
+        except KeyboardInterrupt:
+            print("\n[auto_confirm] stopped by user.")
+            return
         except Exception as e:
             print("[auto_confirm] error:", str(e))
             time.sleep(backoff)
-            backoff = min(backoff * 2, 30)
+            backoff = min(backoff * 2.0, 30.0)
 
 if __name__ == "__main__":
     main()
