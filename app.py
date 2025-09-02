@@ -329,8 +329,6 @@ def keepalive():
     if KEEPALIVE_REDIRECT:
         return redirect(KEEPALIVE_REDIRECT, code=302)
     return jsonify({"ok": True, "msg": "keepalive", "time_ist": now_s()})
-
-# ───────── Friendly index (HTML) ─────────
 @app.get("/")
 def index():
     start_engine_once()
@@ -361,44 +359,162 @@ def index():
         </div>
         """
 
-    # Logged in view
+    # Logged-in view with form + queue panel
     return f"""
     <!doctype html>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Kite Day Trader</title>
     <style>
-      body{{font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;margin:24px;}}
-      .btn{{display:inline-block;padding:10px 16px;background:#2e7d32;color:#fff;text-decoration:none;border-radius:6px}}
-      .row a{{margin-right:12px}}
+      body{{font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;margin:20px;}}
+      h2{{margin:0 0 6px}}
+      .meta{{margin:0 0 16px;color:#444}}
       .pill{{padding:2px 8px;border-radius:999px;background:#e8f5e9}}
-      code{{background:#f6f8fa;padding:2px 6px;border-radius:4px}}
-      pre{{background:#fafafa;padding:10px;border-radius:6px;overflow:auto}}
+      .row a{{margin-right:12px}}
+      .card{{border:1px solid #eee;border-radius:8px;padding:14px;margin:14px 0;background:#fff}}
+      label{{display:block;margin:8px 0 4px;font-weight:600}}
+      input,select{{width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px}}
+      .grid{{display:grid;grid-template-columns:repeat(2, minmax(0,1fr));gap:12px}}
+      .btn{{display:inline-block;padding:10px 16px;background:#2e7d32;color:#fff;text-decoration:none;border-radius:6px;border:0;cursor:pointer}}
+      .btn2{{display:inline-block;padding:10px 16px;background:#1976d2;color:#fff;text-decoration:none;border-radius:6px;border:0;cursor:pointer}}
+      .btn:disabled, .btn2:disabled{{opacity:.6;cursor:not-allowed}}
+      table{{width:100%;border-collapse:collapse}}
+      th,td{{padding:6px 8px;border-bottom:1px solid #eee;text-align:left;font-size:13px;}}
+      code,pre{{background:#f6f8fa;padding:2px 6px;border-radius:4px}}
+      .hint{{color:#666;font-size:12px;margin-top:6px}}
     </style>
-    <h2>Kite Day Trader</h2>
-    <p>Status: <span class="pill">Logged in</span> • Market live: <b>{"Yes" if is_live else "No"}</b></p>
 
+    <h2>Kite Day Trader</h2>
+    <p class="meta">Status: <span class="pill">Logged in</span> • Market live: <b>{"Yes" if is_live else "No"}</b></p>
     <div class="row">
       <a href="/api/status" target="_blank">/api/status</a>
       <a href="/ping" target="_blank">/ping</a>
       <a href="{keepalive_url}" target="_blank">/keepalive</a>
     </div>
 
-    <h3 style="margin-top:24px">Quick API</h3>
-    <p>Scan:</p>
-    <pre><code>POST /api/scan
-{{"interval":"15minute","tp_pct":0.8,"sl_pct":0.4,
- "entry_order_type":"LIMIT","exit_order_pref":"AUTO",
- "investment_target":12000}}</code></pre>
+    <div class="card">
+      <h3 style="margin:0 0 10px">Queue a test order</h3>
+      <div class="grid">
+        <div>
+          <label>Symbol</label>
+          <input id="f_symbol" placeholder="e.g. RELIANCE" />
+        </div>
+        <div>
+          <label>Side</label>
+          <select id="f_side">
+            <option>LONG</option>
+            <option>SHORT</option>
+          </select>
+        </div>
+        <div>
+          <label>Qty</label>
+          <input id="f_qty" type="number" min="1" value="1" />
+        </div>
+        <div>
+          <label>Entry order type</label>
+          <select id="f_eot">
+            <option>LIMIT</option>
+            <option>MARKET</option>
+          </select>
+        </div>
+        <div>
+          <label>TP %</label>
+          <input id="f_tp" type="number" step="0.01" value="0.8" />
+        </div>
+        <div>
+          <label>SL %</label>
+          <input id="f_sl" type="number" step="0.01" value="0.4" />
+        </div>
+        <div>
+          <label>Exit order pref</label>
+          <select id="f_xpref">
+            <option>AUTO</option>
+            <option>LIMIT</option>
+            <option>MARKET</option>
+          </select>
+        </div>
+      </div>
+      <div style="margin-top:12px">
+        <button class="btn2" id="btnQueue">Queue order</button>
+        <span id="queueMsg" class="hint"></span>
+      </div>
+    </div>
 
-    <p>Queue an order (example):</p>
-    <pre><code>POST /api/queue_order
-{{"symbol":"RELIANCE","side":"LONG","qty":1,
- "entry_order_type":"LIMIT","tp_pct":0.8,"sl_pct":0.4,
- "exit_order_pref":"AUTO"}}</code></pre>
+    <div class="card">
+      <h3 style="margin:0 0 10px">Pending queue</h3>
+      <table id="qtable">
+        <thead><tr><th>#</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th><th>TP%</th><th>SL%</th><th>Exit</th><th>Queued at</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="hint">Auto-refreshes every 5s. Sidecar will confirm automatically; or confirm manually below.</div>
+    </div>
 
-    <p>Confirm (auto-confirm uses index=0):</p>
-    <pre><code>POST /api/confirm
-{{"index":0,"token":"&lt;AUTO_CONFIRM_TOKEN&gt;"}}</code></pre>
+    <div class="card">
+      <h3 style="margin:0 0 10px">Confirm next (manual)</h3>
+      <label>Token (AUTO_CONFIRM_TOKEN)</label>
+      <input id="f_token" placeholder="enter token…" />
+      <div style="margin-top:12px">
+        <button class="btn" id="btnConfirm">Confirm index 0</button>
+        <span id="confirmMsg" class="hint"></span>
+      </div>
+    </div>
+
+    <script>
+      async function postJSON(url, body) {{
+        const r = await fetch(url, {{
+          method: 'POST',
+          headers: {{'Content-Type':'application/json'}},
+          body: JSON.stringify(body)
+        }});
+        let data; 
+        try {{ data = await r.json(); }} catch (e) {{ data = {{ok:false, error:(await r.text()).slice(0,200)}}; }}
+        return data;
+      }}
+
+      async function refreshQueue() {{
+        const r = await fetch('/api/pending');
+        let data = {{pending:[]}};
+        try {{ data = await r.json(); }} catch(e) {{}}
+        const tb = document.querySelector('#qtable tbody');
+        tb.innerHTML = '';
+        (data.pending||[]).forEach((row, i) => {{
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${{i}}</td><td>${{row.symbol}}</td><td>${{row.side}}</td>
+                          <td>${{row.qty}}</td><td>${{row.entry_order_type}}</td>
+                          <td>${{row.tp_pct}}</td><td>${{row.sl_pct}}</td>
+                          <td>${{row.exit_order_pref}}</td><td>${{row.queued_at||''}}</td>`;
+          tb.appendChild(tr);
+        }});
+      }}
+      setInterval(refreshQueue, 5000);
+      refreshQueue();
+
+      document.querySelector('#btnQueue').addEventListener('click', async () => {{
+        const payload = {{
+          symbol: document.querySelector('#f_symbol').value.trim(),
+          side: document.querySelector('#f_side').value,
+          qty: Number(document.querySelector('#f_qty').value||1),
+          entry_order_type: document.querySelector('#f_eot').value,
+          tp_pct: Number(document.querySelector('#f_tp').value||0),
+          sl_pct: Number(document.querySelector('#f_sl').value||0),
+          exit_order_pref: document.querySelector('#f_xpref').value
+        }};
+        const msg = document.querySelector('#queueMsg');
+        msg.textContent = '…queueing';
+        const res = await postJSON('/api/queue_order', payload);
+        msg.textContent = res.ok ? 'Queued ✓' : ('Error: ' + (res.error||''));
+        if (res.ok) refreshQueue();
+      }});
+
+      document.querySelector('#btnConfirm').addEventListener('click', async () => {{
+        const token = document.querySelector('#f_token').value.trim();
+        const msg = document.querySelector('#confirmMsg');
+        if (!token) {{ msg.textContent = 'Token required'; return; }}
+        msg.textContent = '…confirming';
+        const res = await postJSON('/api/confirm', {{index:0, token}});
+        msg.textContent = res.ok ? 'Confirmed ✓' : ('Error: ' + (res.error||''));
+        if (res.ok) refreshQueue();
+      }});
+    </script>
     """
 
 @app.get("/api/status")
