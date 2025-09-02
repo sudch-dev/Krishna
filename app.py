@@ -2,7 +2,6 @@ import os, math, threading, time, traceback
 from datetime import datetime, timedelta
 from functools import wraps
 
-import pandas as pd
 import numpy as np
 from flask import Flask, jsonify, request, redirect, url_for
 from pytz import timezone
@@ -13,7 +12,7 @@ IST = timezone("Asia/Kolkata")
 
 KITE_API_KEY       = os.environ.get("KITE_API_KEY", "")
 KITE_API_SECRET    = os.environ.get("KITE_API_SECRET", "")
-INVEST_AMOUNT      = float(os.environ.get("INVEST_AMOUNT", "10000"))   # ₹ default
+INVEST_AMOUNT      = float(os.environ.get("INVEST_AMOUNT", "10000"))
 AUTO_CONFIRM_TOKEN = os.environ.get("AUTO_CONFIRM_TOKEN", "changeme")
 REDIRECT_URL       = os.environ.get("REDIRECT_URL", "http://localhost:5000/login/callback")
 KEEPALIVE_REDIRECT = os.environ.get("KEEPALIVE_REDIRECT", "").strip()
@@ -29,14 +28,13 @@ NIFTY50 = [
 
 app = Flask(__name__)
 
-# ───────── Minimal in-memory state ─────────
 state = {
     "access_token": None,
     "instrument_map": {},   # {"RELIANCE": 738561, ...}
-    "positions": {},        # symbol -> position dict
-    "closed_trades": [],    # list of position dicts (closed)
-    "pending_confirms": [], # queue for manual/auto confirm
-    "engine_running": False
+    "positions": {},
+    "closed_trades": [],
+    "pending_confirms": [],
+    "engine_running": False,
 }
 
 # ───────── Helpers ─────────
@@ -71,7 +69,7 @@ def require_authed(fn):
 # ───────── Auth ─────────
 @app.get("/login/start")
 def login_start():
-    _ = kite().generate_session  # ensure client
+    _ = kite().generate_session
     return redirect(kite().login_url())
 
 @app.get("/login/callback")
@@ -87,14 +85,18 @@ def login_callback():
     except Exception as e:
         return f"Login failed: {e}", 500
 
-# ───────── Market data & indicators ─────────
+# ───────── Instruments & candles (no pandas) ─────────
 def ensure_instruments_loaded():
     if state["instrument_map"]:
         return
-    ins = kite().instruments("NSE")
-    df = pd.DataFrame(ins)
-    m = df[df["tradingsymbol"].isin(NIFTY50)][["tradingsymbol","instrument_token"]]
-    state["instrument_map"] = {r.tradingsymbol: int(r.instrument_token) for _, r in m.iterrows()}
+    instruments = kite().instruments("NSE")
+    wanted = set(NIFTY50)
+    mapping = {}
+    for row in instruments:
+        ts = row.get("tradingsymbol")
+        if ts in wanted:
+            mapping[ts] = int(row.get("instrument_token"))
+    state["instrument_map"] = mapping
 
 def get_candles(symbol, interval="15minute", lookback=200):
     ensure_instruments_loaded()
@@ -104,25 +106,55 @@ def get_candles(symbol, interval="15minute", lookback=200):
     end = now_ist()
     days = 14 if "minute" in interval else 365
     start = end - timedelta(days=days)
-    data = kite().historical_data(token, start, end, interval, continuous=False, oi=False)
-    df = pd.DataFrame(data) if data else pd.DataFrame()
-    return df.tail(lookback).reset_index(drop=True)
+    data = kite().historical_data(token, start, end, interval, continuous=False, oi=False) or []
+    # Convert to arrays
+    closes = np.array([d["close"] for d in data], dtype=float)
+    highs  = np.array([d["high"]  for d in data], dtype=float)
+    lows   = np.array([d["low"]   for d in data], dtype=float)
+    return {
+        "close": closes[-lookback:],
+        "high":  highs[-lookback:],
+        "low":   lows[-lookback:]
+    }
 
-def ema(series, span): return series.ewm(span=span, adjust=False).mean()
+# ───────── Indicators (numpy) ─────────
+def ema(arr, span):
+    arr = np.asarray(arr, dtype=float)
+    if arr.size == 0: return arr
+    alpha = 2.0/(span+1.0)
+    out = np.empty_like(arr)
+    out[0] = arr[0]
+    for i in range(1, arr.size):
+        out[i] = alpha*arr[i] + (1-alpha)*out[i-1]
+    return out
 
-def rsi(series, period=14):
-    d = series.diff()
-    up = d.clip(lower=0); down = -1*d.clip(upper=0)
-    rs = up.ewm(com=period-1, adjust=False).mean() / (down.ewm(com=period-1, adjust=False).mean().replace(0, np.nan))
-    return 100 - (100/(1+rs))
+def rsi(arr, period=14):
+    arr = np.asarray(arr, dtype=float)
+    if arr.size <= period: 
+        return np.zeros_like(arr)
+    delta = np.diff(arr, prepend=arr[0])
+    up = np.clip(delta, 0, None)
+    down = -np.clip(delta, None, 0)
+    # Wilder's smoothing
+    ru = np.empty_like(arr)
+    rd = np.empty_like(arr)
+    ru[:]=0; rd[:]=0
+    ru[period] = up[1:period+1].mean()
+    rd[period] = down[1:period+1].mean()
+    for i in range(period+1, arr.size):
+        ru[i] = (ru[i-1]*(period-1)+up[i])/period
+        rd[i] = (rd[i-1]*(period-1)+down[i])/period
+    rs = np.divide(ru, rd, out=np.zeros_like(ru), where=rd!=0)
+    rsi = 100 - (100/(1+rs))
+    return rsi
 
-def classic_pivots(daily_df):
-    if len(daily_df) < 2: return None
-    prev = daily_df.iloc[-2]
-    P = (prev["high"] + prev["low"] + prev["close"]) / 3.0
+def classic_pivot_from_prev(highs, lows, closes):
+    if highs.size < 2 or lows.size < 2 or closes.size < 2:
+        return None
+    P = (highs[-2] + lows[-2] + closes[-2]) / 3.0
     return {"P": float(P)}
 
-def qty_for_invest(ltp, rupees): 
+def qty_for_invest(ltp, rupees):
     return int(max(1, math.floor(rupees / max(ltp, 0.01))))
 
 # ───────── Decision: scan → picks ─────────
@@ -138,35 +170,42 @@ def api_scan():
     invest_amt = float(p.get("investment_target") or INVEST_AMOUNT)
 
     long_picks, short_picks, errors = [], [], []
-    daily_cache = {}
+    piv_cache = {}
     for sym in NIFTY50:
         try:
-            df = get_candles(sym, interval=interval, lookback=250)
-            if df.empty or len(df) < 30: 
+            bars = get_candles(sym, interval=interval, lookback=250)
+            closes = bars["close"]
+            if closes.size < 30:
                 continue
-            df["ema5"]  = ema(df["close"], 5)
-            df["ema10"] = ema(df["close"], 10)
-            df["rsi14"] = rsi(df["close"], 14)
-            last = df.iloc[-1]
+            ema5  = ema(closes, 5)
+            ema10 = ema(closes, 10)
+            rsi14 = rsi(closes, 14)
+            ltp   = float(closes[-1])
 
-            if sym not in daily_cache:
-                ddf = get_candles(sym, interval="day", lookback=20)
-                daily_cache[sym] = classic_pivots(ddf) if not ddf.empty else None
-            piv  = daily_cache[sym]
-            ltp  = float(last["close"])
-            bull = (last["ema5"] > last["ema10"]) and (last["rsi14"] > 50) and (last["rsi14"] > df["rsi14"].iloc[-2]) and (piv is None or ltp > piv["P"])
-            bear = (last["ema5"] < last["ema10"]) and (last["rsi14"] < 50) and (last["rsi14"] < df["rsi14"].iloc[-2]) and (piv is None or ltp < piv["P"])
+            if sym not in piv_cache:
+                d = get_candles(sym, interval="day", lookback=20)
+                piv_cache[sym] = classic_pivot_from_prev(d["high"], d["low"], d["close"])
+            piv = piv_cache[sym]
+
+            rsi_rising = rsi14[-1] > rsi14[-2]
+            rsi_falling= rsi14[-1] < rsi14[-2]
+            bull = (ema5[-1] > ema10[-1]) and (rsi14[-1] > 50) and rsi_rising and (piv is None or ltp > piv["P"])
+            bear = (ema5[-1] < ema10[-1]) and (rsi14[-1] < 50) and rsi_falling and (piv is None or ltp < piv["P"])
 
             if bull:
-                long_picks.append({"symbol": sym, "ltp": ltp, "qty": qty_for_invest(ltp, invest_amt),
-                                   "tp_pct": tp_pct, "sl_pct": sl_pct,
-                                   "entry_order_type": entry_type, "exit_order_pref": exit_pref,
-                                   "interval": interval})
+                long_picks.append({
+                    "symbol": sym, "ltp": ltp, "qty": qty_for_invest(ltp, invest_amt),
+                    "tp_pct": tp_pct, "sl_pct": sl_pct,
+                    "entry_order_type": entry_type, "exit_order_pref": exit_pref,
+                    "interval": interval
+                })
             elif bear:
-                short_picks.append({"symbol": sym, "ltp": ltp, "qty": qty_for_invest(ltp, invest_amt),
-                                    "tp_pct": tp_pct, "sl_pct": sl_pct,
-                                    "entry_order_type": entry_type, "exit_order_pref": exit_pref,
-                                    "interval": interval})
+                short_picks.append({
+                    "symbol": sym, "ltp": ltp, "qty": qty_for_invest(ltp, invest_amt),
+                    "tp_pct": tp_pct, "sl_pct": sl_pct,
+                    "entry_order_type": entry_type, "exit_order_pref": exit_pref,
+                    "interval": interval
+                })
         except Exception as e:
             errors.append({"symbol": sym, "error": str(e)})
 
@@ -233,14 +272,14 @@ def api_confirm():
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
     if not state["pending_confirms"]:
         return jsonify({"ok": True, "empty": True})
-    job = state["pending_confirms"].pop(0)  # always pop head
+    job = state["pending_confirms"].pop(0)  # pop head
     try:
         res = place_entry_and_track(job)
         return jsonify({"ok": True, "result": res})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ───────── TP/SL monitor (kept, but tiny) ─────────
+# ───────── TP/SL monitor ─────────
 def monitor_loop():
     while True:
         try:
@@ -261,19 +300,17 @@ def monitor_loop():
                 if not reason: 
                     continue
 
-                # exit order type: AUTO (market if live, else limit)
                 otype = "MARKET" if (pos["exit_pref"].upper()=="MARKET" or (pos["exit_pref"].upper()=="AUTO" and market_live_now())) else "LIMIT"
                 exit_txn = KiteConnect.TRANSACTION_TYPE_SELL if side=="LONG" else KiteConnect.TRANSACTION_TYPE_BUY
                 exit_price = target if otype=="LIMIT" else None
 
                 try:
-                    exit_oid = submit_order(sym, exit_txn, qty, otype, price=exit_price, tag=f"exit-{reason}")
+                    submit_order(sym, exit_txn, qty, otype, price=exit_price, tag=f"exit-{reason}")
                     pnl = (price - ent)*qty if side=="LONG" else (ent - price)*qty
-                    pos.update({"open": False, "closed_at": now_s(), "exit_reason": reason,
-                                "exit_order_id": exit_oid, "pnl": round(pnl, 2)})
+                    pos.update({"open": False, "closed_at": now_s(), "exit_reason": reason, "pnl": round(pnl, 2)})
                     state["closed_trades"].append(pos.copy())
                 except Exception:
-                    pass  # keep it minimal
+                    pass
         except Exception:
             pass
         time.sleep(5)
@@ -283,7 +320,7 @@ def start_engine_once():
         threading.Thread(target=monitor_loop, daemon=True).start()
         state["engine_running"] = True
 
-# ───────── Health / minimal status ─────────
+# ───────── Health ─────────
 @app.get("/ping")
 def ping():
     return jsonify({"pong": True, "time_ist": now_s()})
@@ -317,7 +354,6 @@ def api_status():
         "logged_in": bool(state["access_token"])
     })
 
-# ───────── Entrypoint (Flask only) ─────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
