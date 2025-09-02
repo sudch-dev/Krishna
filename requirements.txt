@@ -3,3 +3,4 @@ kiteconnect
 python-dotenv
 gunicorn
 pytz
+pandas
