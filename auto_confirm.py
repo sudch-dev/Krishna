@@ -1,80 +1,66 @@
 #!/usr/bin/env python3
 """
-Confirm-only sidecar for the Kite day-trader app.
+Sidecar executor for Kite Day Trader.
 
-It DOES NOT scan or queue.
-It ONLY confirms already-queued jobs.
-
-Env:
-  APP_URL              e.g. https://<your-app>.onrender.com   (required)
-  AUTO_CONFIRM_TOKEN   must match server's env                 (required)
-  POLL_SEC             seconds between polls (default 3)
-  KEEPALIVE_URL        optional; GET this every POLL_SEC*5
+Usage:
+  export APP_URL="https://<your-app>.onrender.com"
+  export AUTO_CONFIRM_TOKEN="same-as-app"
+  export KITE_API_KEY="..."
+  export KITE_API_SECRET="..."
+  python sidecar.py
 """
-import os, time, sys, requests
+import os, time, requests, traceback
+from kiteconnect import KiteConnect
+from datetime import datetime
+from pytz import timezone
 
-APP_URL = os.environ.get("APP_URL", "").rstrip("/")
-TOKEN   = os.environ.get("AUTO_CONFIRM_TOKEN", "")
-POLL    = float(os.environ.get("POLL_SEC", "3"))
-KA_URL  = os.environ.get("KEEPALIVE_URL", "").strip()
+IST = timezone("Asia/Kolkata")
+APP_URL = os.environ["APP_URL"].rstrip("/")
+TOKEN   = os.environ["AUTO_CONFIRM_TOKEN"]
 
-if not APP_URL or not TOKEN:
-    print("[auto_confirm] ERROR: Set APP_URL and AUTO_CONFIRM_TOKEN.")
-    sys.exit(1)
+KITE_API_KEY    = os.environ["KITE_API_KEY"]
+KITE_API_SECRET = os.environ["KITE_API_SECRET"]
 
-S = requests.Session()
-S.headers.update({"User-Agent": "auto-confirm/1.1"})
+kite = KiteConnect(api_key=KITE_API_KEY)
 
-def get_pending():
-    r = S.get(f"{APP_URL}/api/pending", timeout=10)
-    r.raise_for_status()
-    return (r.json() or {}).get("pending", [])
+def now_s(): return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
-def confirm_index0():
-    payload = {"index": 0, "token": TOKEN}
-    r = S.post(f"{APP_URL}/api/confirm", json=payload, timeout=15)
-    try:
-        return r.json()
-    except Exception:
-        return {"ok": False, "error": r.text[:200]}
+def ensure_login():
+    if not getattr(kite, "_logged_in", False):
+        print("[sidecar] Please login via browser once and set access_token manually!")
+        # for demo, assume you already have access token saved
+        kite.set_access_token(os.environ["KITE_ACCESS_TOKEN"])
+        kite._logged_in = True
 
-def maybe_keepalive(tick):
-    if KA_URL and (tick % 5 == 0):  # every ~5 polls
-        try:
-            S.get(KA_URL, timeout=5)
-        except Exception:
-            pass
-
-def main():
-    print(f"[auto_confirm] watching {APP_URL} ...")
-    backoff = 2.0
-    tick = 0
+def run_loop():
+    ensure_login()
     while True:
         try:
-            tick += 1
-            maybe_keepalive(tick)
-
-            # drain the queue by repeatedly confirming index 0
-            while True:
-                pending = get_pending()
-                if not pending:
-                    break
-                res = confirm_index0()
-                print("[auto_confirm] confirm ->", res)
-                # small pause to let server update state
-                time.sleep(1.0)
-
-            # nothing pending → sleep regular poll
-            time.sleep(POLL)
-            backoff = 2.0
-
-        except KeyboardInterrupt:
-            print("\n[auto_confirm] stopped by user.")
-            return
+            r = requests.get(f"{APP_URL}/api/pending", timeout=10)
+            pending = r.json().get("pending", [])
+            for idx, job in enumerate(pending):
+                if job.get("confirmed") and not job.get("executed"):
+                    print(f"[sidecar] Executing -> {job}")
+                    try:
+                        oid = kite.place_order(
+                            variety="regular",
+                            exchange="NSE",
+                            tradingsymbol=job["symbol"],
+                            transaction_type=("BUY" if job["side"]=="LONG" else "SELL"),
+                            quantity=int(job["qty"]),
+                            product=KiteConnect.PRODUCT_MIS,
+                            order_type=job["entry_order_type"],
+                            validity=KiteConnect.VALIDITY_DAY,
+                            price=None
+                        )
+                        print(f"[sidecar] Order placed -> {oid}")
+                        job["executed"] = True
+                    except Exception as e:
+                        print("[sidecar] ERROR placing order:", str(e))
+            time.sleep(5)
         except Exception as e:
-            print("[auto_confirm] error:", str(e))
-            time.sleep(backoff)
-            backoff = min(backoff * 2.0, 30.0)
+            print("[sidecar] loop error:", e)
+            time.sleep(10)
 
 if __name__ == "__main__":
-    main()
+    run_loop()
