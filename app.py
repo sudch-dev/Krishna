@@ -81,7 +81,7 @@ def login_callback():
         data = kite().generate_session(req_token, api_secret=KITE_API_SECRET)
         state["access_token"] = data["access_token"]
         kite().set_access_token(state["access_token"])
-        return redirect(url_for("root"))
+        return redirect(url_for("index"))
     except Exception as e:
         return f"Login failed: {e}", 500
 
@@ -107,7 +107,6 @@ def get_candles(symbol, interval="15minute", lookback=200):
     days = 14 if "minute" in interval else 365
     start = end - timedelta(days=days)
     data = kite().historical_data(token, start, end, interval, continuous=False, oi=False) or []
-    # Convert to arrays
     closes = np.array([d["close"] for d in data], dtype=float)
     highs  = np.array([d["high"]  for d in data], dtype=float)
     lows   = np.array([d["low"]   for d in data], dtype=float)
@@ -331,15 +330,76 @@ def keepalive():
         return redirect(KEEPALIVE_REDIRECT, code=302)
     return jsonify({"ok": True, "msg": "keepalive", "time_ist": now_s()})
 
+# ───────── Friendly index (HTML) ─────────
 @app.get("/")
-def root():
+def index():
     start_engine_once()
-    return jsonify({
-        "ok": True,
-        "live": market_live_now(),
-        "logged_in": bool(state["access_token"]),
-        "redirect_url": REDIRECT_URL
-    })
+    is_live = market_live_now()
+    logged_in = bool(state["access_token"])
+    keepalive_url = KEEPALIVE_REDIRECT or "/keepalive"
+
+    if not logged_in:
+        return f"""
+        <!doctype html>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Kite Day Trader</title>
+        <style>
+          body{{font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;margin:24px;}}
+          .btn{{display:inline-block;padding:10px 16px;background:#1976d2;color:#fff;text-decoration:none;border-radius:6px}}
+          .row a{{margin-right:12px}}
+          .pill{{padding:2px 8px;border-radius:999px;background:#eef}}
+          code{{background:#f6f8fa;padding:2px 6px;border-radius:4px}}
+        </style>
+        <h2>Kite Day Trader</h2>
+        <p>Status: <span class="pill">Not logged in</span> • Market live: <b>{"Yes" if is_live else "No"}</b></p>
+        <p><a class="btn" href="/login/start">Login with Kite</a></p>
+        <p>Callback configured: <code>{REDIRECT_URL}</code></p>
+        <div class="row">
+          <a href="/ping" target="_blank">/ping</a>
+          <a href="{keepalive_url}" target="_blank">/keepalive</a>
+          <a href="/api/status" target="_blank">/api/status</a>
+        </div>
+        """
+
+    # Logged in view
+    return f"""
+    <!doctype html>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kite Day Trader</title>
+    <style>
+      body{{font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;margin:24px;}}
+      .btn{{display:inline-block;padding:10px 16px;background:#2e7d32;color:#fff;text-decoration:none;border-radius:6px}}
+      .row a{{margin-right:12px}}
+      .pill{{padding:2px 8px;border-radius:999px;background:#e8f5e9}}
+      code{{background:#f6f8fa;padding:2px 6px;border-radius:4px}}
+      pre{{background:#fafafa;padding:10px;border-radius:6px;overflow:auto}}
+    </style>
+    <h2>Kite Day Trader</h2>
+    <p>Status: <span class="pill">Logged in</span> • Market live: <b>{"Yes" if is_live else "No"}</b></p>
+
+    <div class="row">
+      <a href="/api/status" target="_blank">/api/status</a>
+      <a href="/ping" target="_blank">/ping</a>
+      <a href="{keepalive_url}" target="_blank">/keepalive</a>
+    </div>
+
+    <h3 style="margin-top:24px">Quick API</h3>
+    <p>Scan:</p>
+    <pre><code>POST /api/scan
+{{"interval":"15minute","tp_pct":0.8,"sl_pct":0.4,
+ "entry_order_type":"LIMIT","exit_order_pref":"AUTO",
+ "investment_target":12000}}</code></pre>
+
+    <p>Queue an order (example):</p>
+    <pre><code>POST /api/queue_order
+{{"symbol":"RELIANCE","side":"LONG","qty":1,
+ "entry_order_type":"LIMIT","tp_pct":0.8,"sl_pct":0.4,
+ "exit_order_pref":"AUTO"}}</code></pre>
+
+    <p>Confirm (auto-confirm uses index=0):</p>
+    <pre><code>POST /api/confirm
+{{"index":0,"token":"&lt;AUTO_CONFIRM_TOKEN&gt;"}}</code></pre>
+    """
 
 @app.get("/api/status")
 def api_status():
