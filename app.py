@@ -11,11 +11,14 @@ from kiteconnect import KiteConnect
 # ───────────────────────── Config ─────────────────────────
 IST = timezone("Asia/Kolkata")
 
-KITE_API_KEY     = os.environ.get("KITE_API_KEY", "")
-KITE_API_SECRET  = os.environ.get("KITE_API_SECRET", "")
-INVEST_AMOUNT    = float(os.environ.get("INVEST_AMOUNT", "10000"))   # ₹ default
+KITE_API_KEY       = os.environ.get("KITE_API_KEY", "")
+KITE_API_SECRET    = os.environ.get("KITE_API_SECRET", "")
+INVEST_AMOUNT      = float(os.environ.get("INVEST_AMOUNT", "10000"))   # ₹ default
 AUTO_CONFIRM_TOKEN = os.environ.get("AUTO_CONFIRM_TOKEN", "changeme")
-REDIRECT_URL     = os.environ.get("REDIRECT_URL", "http://localhost:5000/login/callback")
+REDIRECT_URL       = os.environ.get("REDIRECT_URL", "http://localhost:5000/login/callback")
+
+# NEW (optional): if set, /keepalive will 302 to this URL
+KEEPALIVE_REDIRECT = os.environ.get("KEEPALIVE_REDIRECT", "").strip()
 
 # NIFTY 50 symbols (tradingsymbols on NSE; edit if needed)
 NIFTY50 = [
@@ -46,23 +49,25 @@ state = {
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
+def now_ist():
+    return datetime.now(IST)
+
+def now_ist_str():
+    return now_ist().strftime("%Y-%m-%d %H:%M:%S")
+
 def log_trade(msg, payload=None):
     entry = {"ts": now_ist_str(), "msg": msg, "payload": payload or {}}
     state["trade_log"].append(entry)
+    os.makedirs(LOG_DIR, exist_ok=True)
     with open(os.path.join(LOG_DIR, "trade_log.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 def log_error(msg, payload=None):
     entry = {"ts": now_ist_str(), "msg": msg, "payload": payload or {}}
     state["error_log"].append(entry)
+    os.makedirs(LOG_DIR, exist_ok=True)
     with open(os.path.join(LOG_DIR, "error_log.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-def now_ist():
-    return datetime.now(IST)
-
-def now_ist_str():
-    return now_ist().strftime("%Y-%m-%d %H:%M:%S")
 
 def market_live_now():
     dt = now_ist()
@@ -140,8 +145,7 @@ def get_candles(symbol, interval="15minute", lookback=200):
     if not data:
         return pd.DataFrame()
     df = pd.DataFrame(data)
-    # rename columns for consistency
-    df.rename(columns={"date":"date","open":"open","high":"high","low":"low","close":"close","volume":"volume"}, inplace=True)
+    # harmonized column names already fine with Kite
     return df.tail(lookback).reset_index(drop=True)
 
 def ema(series, span):
@@ -191,7 +195,7 @@ def api_scan():
       "tp_pct": 0.8,
       "sl_pct": 0.4,
       "entry_order_type": "LIMIT" | "MARKET",
-      "exit_order_pref": "AUTO",     # AUTO = limit off-market, market live
+      "exit_order_pref": "AUTO",
       "investment_target": 12000
     }
     """
@@ -225,29 +229,29 @@ def api_scan():
                     daily_cache[sym] = piv
                 piv = daily_cache[sym]
 
-                ltp = float(last["close"])
-                # RSI "bullish" heuristic: RSI > 50 and rising
+                ltp_val = float(last["close"])
+                # RSI heuristics
                 rsi_bull = last["rsi14"] > 50 and (last["rsi14"] > df["rsi14"].iloc[-2])
                 rsi_bear = last["rsi14"] < 50 and (last["rsi14"] < df["rsi14"].iloc[-2])
                 ema_bull = last["ema5"] > last["ema10"]
                 ema_bear = last["ema5"] < last["ema10"]
 
-                pivot_ok_long = True if (piv is None) else (ltp > piv["P"])
-                pivot_ok_short = True if (piv is None) else (ltp < piv["P"])
+                pivot_ok_long = True if (piv is None) else (ltp_val > piv["P"])
+                pivot_ok_short = True if (piv is None) else (ltp_val < piv["P"])
 
                 if ema_bull and rsi_bull and pivot_ok_long:
-                    qty = qty_for_invest(sym, ltp, invest_amt)
+                    qty = qty_for_invest(sym, ltp_val, invest_amt)
                     long_picks.append({
-                        "symbol": sym, "ltp": ltp, "qty": qty,
+                        "symbol": sym, "ltp": ltp_val, "qty": qty,
                         "tp_pct": tp_pct, "sl_pct": sl_pct,
                         "entry_order_type": entry_type,
                         "exit_order_pref": exit_pref,
                         "interval": interval
                     })
                 elif ema_bear and rsi_bear and pivot_ok_short:
-                    qty = qty_for_invest(sym, ltp, invest_amt)
+                    qty = qty_for_invest(sym, ltp_val, invest_amt)
                     short_picks.append({
-                        "symbol": sym, "ltp": ltp, "qty": qty,
+                        "symbol": sym, "ltp": ltp_val, "qty": qty,
                         "tp_pct": tp_pct, "sl_pct": sl_pct,
                         "entry_order_type": entry_type,
                         "exit_order_pref": exit_pref,
@@ -295,15 +299,17 @@ def api_confirm():
     """
     Body JSON: { "index": 0, "token": "AUTO_CONFIRM_TOKEN" }
     Removes from pending queue and places the order immediately.
+    Sidecar calls this repeatedly with index=0 to avoid shifting.
     """
     p = request.get_json(force=True)
     token = p.get("token","")
     idx = int(p.get("index", -1))
     if token != AUTO_CONFIRM_TOKEN:
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    if not (0 <= idx < len(state["pending_confirms"])):
-        return jsonify({"ok": False, "error": "Index out of range"}), 400
-    job = state["pending_confirms"].pop(idx)
+    if not state["pending_confirms"]:
+        return jsonify({"ok": True, "empty": True})
+    # Enforce head pop for safety regardless of idx
+    job = state["pending_confirms"].pop(0)
     try:
         res = place_entry_and_track(job)
         return jsonify({"ok": True, "result": res})
@@ -438,6 +444,19 @@ def start_engine():
         state["engine_running"] = True
         log_trade("Engine started")
 
+# ───────────────────────── Keep-alive / Health ─────────────────────────
+@app.get("/ping")
+def ping():
+    return jsonify({"pong": True, "time_ist": now_ist_str()})
+
+@app.get("/keepalive")
+def keepalive():
+    # If env is set, redirect; otherwise return OK JSON
+    from flask import redirect
+    if KEEPALIVE_REDIRECT:
+        return redirect(KEEPALIVE_REDIRECT, code=302)
+    return jsonify({"ok": True, "msg": "keepalive", "time_ist": now_ist_str()})
+
 # ───────────────────────── API: status & logs ─────────────────────────
 @app.get("/")
 def index():
@@ -470,5 +489,6 @@ def api_logs():
 
 # ───────────────────────── Main ─────────────────────────
 if __name__ == "__main__":
-    print(f"[{now_ist_str()}] Starting server on http://localhost:5000")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 10000))
+    print(f"[{now_ist_str()}] Starting server on 0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port)
